@@ -6,7 +6,7 @@ import { writeFile, mkdir, access, constants } from 'fs/promises'
 export const maxDuration = 60
 export const dynamic = 'force-dynamic'
 
-const MAX_FILE_SIZE = 50 * 1024 * 1024 // 50MB
+const MAX_TOTAL_SIZE = 50 * 1024 * 1024 // 50MB на все файлы в одном запросе
 const ALLOWED_EXTENSIONS = ['.pdf', '.doc', '.docx', '.txt', '.zip', '.jpg', '.jpeg', '.png', '.rar', '.7z']
 const ALLOWED_MIME_TYPES = [
   'application/pdf',
@@ -75,7 +75,7 @@ export async function POST(req: NextRequest) {
 
     // Проверяем общий размер
     const totalSize = files.reduce((sum, f) => sum + f.size, 0)
-    if (totalSize > MAX_FILE_SIZE) {
+    if (totalSize > MAX_TOTAL_SIZE) {
       return NextResponse.json(
         { error: 'Общий размер файлов не должен превышать 50МБ' },
         { status: 400 }
@@ -118,6 +118,22 @@ export async function POST(req: NextRequest) {
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error)
     console.error('Upload error:', msg)
+
+    const lower = msg.toLowerCase()
+    if (lower.includes('body') && (lower.includes('too large') || lower.includes('size'))) {
+      return NextResponse.json(
+        { error: 'Слишком большой запрос. Попробуйте загрузить файлы по одному или уменьшить размер.' },
+        { status: 413 }
+      )
+    }
+
+    if (lower.includes('multipart') || lower.includes('formdata')) {
+      return NextResponse.json(
+        { error: 'Не удалось обработать загружаемые файлы (multipart/form-data).' },
+        { status: 400 }
+      )
+    }
+
     return NextResponse.json({ error: `Ошибка загрузки файлов: ${msg}` }, { status: 500 })
   }
 }

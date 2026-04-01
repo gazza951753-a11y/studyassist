@@ -1,7 +1,7 @@
 import nodemailer from 'nodemailer'
 import type Mail from 'nodemailer/lib/mailer'
 import path from 'path'
-import fs from 'fs'
+import { resolveStoredFileAbsolutePath } from '@/lib/file-storage'
 
 const transporter = nodemailer.createTransport({
   host: process.env.SMTP_HOST || 'smtp.beget.com',
@@ -58,8 +58,8 @@ export async function sendNewOrderEmail(data: OrderEmailData): Promise<void> {
   const attachments: Mail.Attachment[] = []
   if (data.files && data.files.length > 0) {
     for (const filePath of data.files) {
-      const fullPath = path.join(process.cwd(), 'public', filePath)
-      if (fs.existsSync(fullPath)) {
+      const fullPath = resolveStoredFileAbsolutePath(filePath)
+      if (fullPath) {
         attachments.push({
           filename: path.basename(filePath),
           path: fullPath,
@@ -168,6 +168,91 @@ export async function sendNewOrderEmail(data: OrderEmailData): Promise<void> {
   })
 }
 
+export async function sendOrderAcceptedEmail(data: OrderEmailData): Promise<void> {
+  const orderLabel = formatOrderId(data.orderId)
+  const typeLabel = getOrderTypeLabel(data.orderType)
+  const dashboardUrl = `${process.env.NEXTAUTH_URL || 'https://studyassist.ru'}/dashboard`
+
+  const htmlContent = `
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Заявка принята — StudyAssist</title>
+</head>
+<body style="margin:0;padding:0;background:#0F0F1A;font-family:Arial,sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:#0F0F1A;padding:40px 0;">
+    <tr>
+      <td align="center">
+        <table width="600" cellpadding="0" cellspacing="0" style="background:#1A1A2E;border-radius:16px;overflow:hidden;border:1px solid rgba(108,62,244,0.3);">
+          <tr>
+            <td style="background:linear-gradient(135deg,#6C3EF4,#3B82F6);padding:32px;text-align:center;">
+              <div style="display:inline-block;width:48px;height:48px;background:rgba(255,255,255,0.2);border-radius:12px;line-height:48px;font-size:24px;margin-bottom:16px;">✅</div>
+              <h1 style="color:#fff;margin:0;font-size:24px;font-weight:700;">Заявка принята</h1>
+              <p style="color:rgba(255,255,255,0.85);margin:8px 0 0;">Номер заявки: ${orderLabel}</p>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:32px;">
+              <p style="color:#F1F5F9;font-size:18px;font-weight:600;margin:0 0 12px;">${data.name}, спасибо за обращение! 👋</p>
+              <p style="color:#94A3B8;font-size:15px;line-height:1.6;margin:0 0 24px;">
+                Мы получили вашу заявку и уже передали её менеджеру. Обычно связываемся в течение 30 минут в рабочее время.
+              </p>
+              <table width="100%" cellpadding="0" cellspacing="0">
+                <tr>
+                  <td style="padding:10px 0;border-bottom:1px solid rgba(255,255,255,0.1);">
+                    <span style="color:#94A3B8;font-size:13px;">Тип работы</span><br>
+                    <span style="color:#F1F5F9;font-size:15px;">${typeLabel}</span>
+                  </td>
+                </tr>
+                <tr>
+                  <td style="padding:10px 0;border-bottom:1px solid rgba(255,255,255,0.1);">
+                    <span style="color:#94A3B8;font-size:13px;">Предмет</span><br>
+                    <span style="color:#F1F5F9;font-size:15px;">${data.subject}</span>
+                  </td>
+                </tr>
+                <tr>
+                  <td style="padding:10px 0;border-bottom:1px solid rgba(255,255,255,0.1);">
+                    <span style="color:#94A3B8;font-size:13px;">Дедлайн</span><br>
+                    <span style="color:#F1F5F9;font-size:15px;">${data.deadline}</span>
+                  </td>
+                </tr>
+                <tr>
+                  <td style="padding:10px 0;">
+                    <span style="color:#94A3B8;font-size:13px;">Прикреплённые файлы</span><br>
+                    <span style="color:#F1F5F9;font-size:15px;">${data.files?.length || 0} шт.</span>
+                  </td>
+                </tr>
+              </table>
+              <div style="text-align:center;margin-top:28px;">
+                <a href="${dashboardUrl}" style="display:inline-block;background:linear-gradient(135deg,#6C3EF4,#3B82F6);color:#fff;padding:14px 32px;border-radius:10px;text-decoration:none;font-weight:700;font-size:15px;">
+                  Открыть личный кабинет
+                </a>
+              </div>
+            </td>
+          </tr>
+          <tr>
+            <td style="background:#0F0F1A;padding:20px 32px;text-align:center;border-top:1px solid rgba(255,255,255,0.05);">
+              <p style="color:#374151;font-size:12px;margin:0;">© 2025 StudyAssist.ru — Все права защищены</p>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>
+  `
+
+  await transporter.sendMail({
+    from: `"StudyAssist" <${process.env.SMTP_USER}>`,
+    to: data.email,
+    subject: `✅ Заявка ${orderLabel} принята — StudyAssist`,
+    html: htmlContent,
+  })
+}
+
 export async function sendStatusUpdateEmail(
   to: string,
   orderId: string,
@@ -200,7 +285,9 @@ export async function sendStatusUpdateEmail(
         <table width="600" cellpadding="0" cellspacing="0" style="background:#1A1A2E;border-radius:16px;overflow:hidden;border:1px solid rgba(108,62,244,0.3);">
           <tr>
             <td style="background:linear-gradient(135deg,#6C3EF4,#3B82F6);padding:32px;text-align:center;">
-              <h1 style="color:#fff;margin:0;font-size:24px;">Обновление заявки ${orderLabel}</h1>
+              <div style="display:inline-block;width:48px;height:48px;background:rgba(255,255,255,0.2);border-radius:12px;line-height:48px;font-size:24px;margin-bottom:16px;">📌</div>
+              <h1 style="color:#fff;margin:0;font-size:24px;font-weight:700;">Обновление заявки ${orderLabel}</h1>
+              <p style="color:rgba(255,255,255,0.8);margin:8px 0 0;font-size:14px;">StudyAssist.ru</p>
             </td>
           </tr>
           <tr>
@@ -219,6 +306,11 @@ export async function sendStatusUpdateEmail(
               <p style="color:#94A3B8;font-size:14px;margin-top:24px;">
                 Вы можете отслеживать статус в <a href="${process.env.NEXTAUTH_URL}/dashboard" style="color:#6C3EF4;">личном кабинете</a>
               </p>
+            </td>
+          </tr>
+          <tr>
+            <td style="background:#0F0F1A;padding:20px 32px;text-align:center;border-top:1px solid rgba(255,255,255,0.05);">
+              <p style="color:#374151;font-size:12px;margin:0;">© 2025 StudyAssist.ru — Все права защищены</p>
             </td>
           </tr>
         </table>

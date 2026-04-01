@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { getServerSession } from 'next-auth'
 import { prisma } from '@/lib/prisma'
 import { authOptions } from '@/lib/auth'
-import { sendNewOrderEmail } from '@/lib/email'
+import { sendNewOrderEmail, sendOrderAcceptedEmail } from '@/lib/email'
 import { sendNewOrderNotification } from '@/lib/telegram'
 import { format } from 'date-fns'
 import { ru } from 'date-fns/locale'
@@ -63,6 +63,17 @@ export async function POST(req: NextRequest) {
           phone: clientPhone || null,
           files: [],
         }),
+        clientEmail ? sendOrderAcceptedEmail({
+          orderId: order.id,
+          orderType: type,
+          subject,
+          deadline: deadlineFormatted,
+          description: description || '',
+          name: clientName || 'Клиент',
+          email: clientEmail,
+          phone: clientPhone || null,
+          files: [],
+        }) : Promise.resolve(),
         sendNewOrderNotification({
           orderId: order.id,
           orderType: type,

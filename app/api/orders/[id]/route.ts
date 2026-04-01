@@ -117,11 +117,12 @@ export async function PATCH(
     })
 
     // Уведомление об изменении статуса
-    if (status && order.user?.email && status !== order.status) {
+    const statusEmail = order.user?.email || order.clientEmail
+    if (status && statusEmail && status !== order.status) {
       Promise.allSettled([
-        sendStatusUpdateEmail(order.user.email, order.id, status, order.paymentLink),
-        order.user.telegramId
-          ? sendStatusUpdateNotification(order.user.telegramId, order.id, status, order.paymentLink)
+        sendStatusUpdateEmail(statusEmail, order.id, status, updatedOrder.paymentLink),
+        order.user?.telegramId
+          ? sendStatusUpdateNotification(order.user.telegramId, order.id, status, updatedOrder.paymentLink)
           : Promise.resolve(),
       ]).catch(console.error)
     }
