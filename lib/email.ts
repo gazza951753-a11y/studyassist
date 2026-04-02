@@ -32,6 +32,15 @@ export interface OrderEmailData {
   files?: string[]
 }
 
+interface OrderReceivedEmailData {
+  orderId: string
+  orderType: string
+  subject: string
+  deadline: string
+  name: string
+  email: string
+}
+
 function getOrderTypeLabel(type: string): string {
   const types: Record<string, string> = {
     coursework: 'Курсовая работа',
@@ -170,7 +179,7 @@ export async function sendNewOrderEmail(data: OrderEmailData): Promise<void> {
   })
 }
 
-export async function sendOrderReceivedEmail(data: OrderEmailData): Promise<void> {
+export async function sendOrderReceivedEmail(data: OrderReceivedEmailData): Promise<void> {
   const orderLabel = formatOrderId(data.orderId)
   const typeLabel = getOrderTypeLabel(data.orderType)
   const baseUrl = process.env.NEXTAUTH_URL || 'https://studyassist.ru'
