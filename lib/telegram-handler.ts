@@ -3,8 +3,9 @@ import { prisma } from '@/lib/prisma'
 import { formatOrderId, getStatusLabel, getOrderTypeLabel } from '@/lib/utils'
 import { format, parse, isValid, addDays } from 'date-fns'
 import { ru } from 'date-fns/locale'
-import { sendNewOrderEmail } from '@/lib/email'
-import { sendNewOrderNotification } from '@/lib/telegram'
+import { sendNewOrderEmail, sendPaymentLinkEmail, sendStatusUpdateEmail, sendWorkCompletedEmail } from '@/lib/email'
+import { sendNewOrderNotification, sendPaymentLinkNotification, sendStatusUpdateNotification, sendWorkCompletedNotification } from '@/lib/telegram'
+import { createPayment } from '@/lib/yukassa'
 import { writeFile, mkdir } from 'fs/promises'
 import path from 'path'
 import os from 'os'
@@ -48,11 +49,23 @@ interface OrderSession {
 
 const sessions = new Map<string, OrderSession>()
 
+interface AdminSession {
+  mode: 'awaiting_price' | 'awaiting_result_files'
+  orderId: string
+  uploadedFiles?: string[]
+  createdAt: number
+}
+
+const adminSessions = new Map<string, AdminSession>()
+
 // Очищаем устаревшие сессии (> 30 мин)
 function cleanSessions() {
   const now = Date.now()
   Array.from(sessions.entries()).forEach(([key, s]) => {
     if (now - s.createdAt > 30 * 60 * 1000) sessions.delete(key)
+  })
+  Array.from(adminSessions.entries()).forEach(([key, s]) => {
+    if (now - s.createdAt > 60 * 60 * 1000) adminSessions.delete(key)
   })
 }
 
@@ -79,6 +92,21 @@ export async function handleUpdate(update: TelegramBot.Update): Promise<void> {
 async function handleMessage(bot: TelegramBot, msg: TelegramBot.Message) {
   const chatId = msg.chat.id.toString()
   const text = (msg.text || '').trim()
+  const user = await prisma.user.findFirst({ where: { telegramId: chatId } })
+  const isAdmin = !!user?.isAdmin
+
+  const adminSession = adminSessions.get(chatId)
+  if (adminSession) {
+    if (adminSession.mode === 'awaiting_result_files' && (msg.document || (msg.photo && msg.photo.length > 0))) {
+      await handleAdminResultFileUpload(bot, chatId, msg, adminSession)
+      return
+    }
+
+    if (adminSession.mode === 'awaiting_price' && text) {
+      await handleAdminPriceInput(bot, chatId, text, adminSession)
+      return
+    }
+  }
 
   // Если есть активная сессия заявки — обрабатываем как шаг формы
   const session = sessions.get(chatId)
@@ -104,11 +132,17 @@ async function handleMessage(bot: TelegramBot, msg: TelegramBot.Message) {
   if (text === '/orders') { await handleOrdersList(bot, chatId); return }
   if (text === '/new' || text === '/заявка') { await startOrderForm(bot, chatId); return }
   if (text === '/profile') { await handleProfile(bot, chatId); return }
-  if (text === '/cancel') { sessions.delete(chatId); await bot.sendMessage(chatId, '❌ Отменено.'); return }
+  if (text === '/cancel') {
+    sessions.delete(chatId)
+    adminSessions.delete(chatId)
+    await bot.sendMessage(chatId, '❌ Отменено.')
+    return
+  }
+  if ((text === '/admin' || text === '/a') && isAdmin) { await handleAdminMenu(bot, chatId); return }
+  if ((text === '/admin_orders' || text === '/ao') && isAdmin) { await handleAdminOrdersList(bot, chatId); return }
   if (text === '/help') { await handleHelp(bot, chatId); return }
 
   // Незалогиненный пользователь
-  const user = await prisma.user.findFirst({ where: { telegramId: chatId } })
   if (!user) {
     await bot.sendMessage(chatId,
       `Привяжите аккаунт StudyAssist, чтобы использовать бот.\n\n` +
@@ -597,15 +631,277 @@ function parseDeadline(text: string): Date | null {
 // ─── /help ───────────────────────────────────────────────────────────────────
 
 async function handleHelp(bot: TelegramBot, chatId: string) {
+  const admin = await prisma.user.findFirst({ where: { telegramId: chatId, isAdmin: true } })
   await bot.sendMessage(chatId,
     `*StudyAssist — команды бота*\n\n` +
     `📂 /orders — мои заявки\n` +
     `📝 /new — оставить заявку\n` +
     `👤 /profile — мой профиль\n` +
+    (admin ? `🛠 /admin — админ-меню\n📋 /admin_orders — последние заявки\n` : '') +
     `❌ /cancel — отменить текущее действие\n` +
     `🌐 /start — главное меню`,
     { parse_mode: 'Markdown' }
   )
+}
+
+async function handleAdminMenu(bot: TelegramBot, chatId: string) {
+  const admin = await prisma.user.findFirst({ where: { telegramId: chatId, isAdmin: true } })
+  if (!admin) {
+    await bot.sendMessage(chatId, '⛔ Команда доступна только администраторам.')
+    return
+  }
+
+  await bot.sendMessage(
+    chatId,
+    `🛠 *Админ-панель в Telegram*\n\n` +
+      `Здесь можно:\n` +
+      `• смотреть заявки и статусы\n` +
+      `• менять статусы\n` +
+      `• выставлять счёт\n` +
+      `• загружать готовые файлы и закрывать заявку`,
+    {
+      parse_mode: 'Markdown',
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: '📋 Последние заявки', callback_data: 'admin:orders' }],
+          [{ text: '🔎 Найти по ID', callback_data: 'admin:find_hint' }],
+        ],
+      },
+    }
+  )
+}
+
+async function handleAdminOrdersList(bot: TelegramBot, chatId: string) {
+  const admin = await prisma.user.findFirst({ where: { telegramId: chatId, isAdmin: true } })
+  if (!admin) {
+    await bot.sendMessage(chatId, '⛔ Команда доступна только администраторам.')
+    return
+  }
+
+  const orders = await prisma.order.findMany({
+    take: 10,
+    orderBy: { createdAt: 'desc' },
+  })
+
+  if (!orders.length) {
+    await bot.sendMessage(chatId, 'Заявок пока нет.')
+    return
+  }
+
+  await bot.sendMessage(chatId, '📋 *Последние заявки*', {
+    parse_mode: 'Markdown',
+    reply_markup: {
+      inline_keyboard: orders.map((o) => {
+        const emoji = STATUS_EMOJI[o.status] || '❓'
+        return [{ text: `${emoji} ${formatOrderId(o.id)} · ${getStatusLabel(o.status)}`, callback_data: `admin:order:${o.id}` }]
+      }),
+    },
+  })
+}
+
+async function handleAdminOrderDetail(bot: TelegramBot, chatId: string, orderId: string) {
+  const admin = await prisma.user.findFirst({ where: { telegramId: chatId, isAdmin: true } })
+  if (!admin) {
+    await bot.sendMessage(chatId, '⛔ Только для администраторов.')
+    return
+  }
+
+  const order = await prisma.order.findUnique({ where: { id: orderId } })
+  if (!order) {
+    await bot.sendMessage(chatId, '❌ Заявка не найдена.')
+    return
+  }
+
+  const contactEmail = order.clientEmail || '—'
+  const contactPhone = order.clientPhone || '—'
+
+  await bot.sendMessage(
+    chatId,
+    `📋 *${formatOrderId(order.id)}*\n` +
+      `📚 Тип: ${getOrderTypeLabel(order.type)}\n` +
+      `📌 Предмет: ${order.subject}\n` +
+      `📅 Дедлайн: ${format(new Date(order.deadline), 'dd.MM.yyyy')}\n` +
+      `🧭 Статус: *${getStatusLabel(order.status)}*\n` +
+      `✉️ Email: ${contactEmail}\n` +
+      `📞 Телефон: ${contactPhone}`,
+    {
+      parse_mode: 'Markdown',
+      reply_markup: {
+        inline_keyboard: [
+          [
+            { text: '🆕 New', callback_data: `set_status:${order.id}:new` },
+            { text: '🔧 В работу', callback_data: `set_status:${order.id}:in_progress` },
+          ],
+          [
+            { text: '✅ На проверку', callback_data: `set_status:${order.id}:ready_for_review` },
+            { text: '🎉 Готово', callback_data: `set_status:${order.id}:completed` },
+          ],
+          [
+            { text: '💳 Выставить счёт', callback_data: `admin:invoice:${order.id}` },
+            { text: '📎 Файлы результата', callback_data: `admin:result:${order.id}` },
+          ],
+          [{ text: '↻ Обновить', callback_data: `admin:order:${order.id}` }],
+          [{ text: '📋 К списку заявок', callback_data: 'admin:orders' }],
+        ],
+      },
+    }
+  )
+}
+
+async function handleAdminPriceInput(bot: TelegramBot, chatId: string, text: string, session: AdminSession) {
+  const amount = Number(text.replace(',', '.').trim())
+  if (!Number.isFinite(amount) || amount <= 0) {
+    await bot.sendMessage(chatId, '⚠️ Введите корректную сумму, например: 3500')
+    return
+  }
+
+  const order = await prisma.order.findUnique({
+    where: { id: session.orderId },
+    include: { user: true },
+  })
+
+  if (!order) {
+    adminSessions.delete(chatId)
+    await bot.sendMessage(chatId, '❌ Заявка не найдена.')
+    return
+  }
+
+  const receiptEmail = order.user?.email || order.clientEmail
+  if (!receiptEmail) {
+    adminSessions.delete(chatId)
+    await bot.sendMessage(chatId, '❌ Нет email у клиента, счёт выставить нельзя.')
+    return
+  }
+
+  const description = `${getOrderTypeLabel(order.type)}: ${order.subject}`
+  const payment = await createPayment(order.id, amount, description, receiptEmail)
+
+  await prisma.order.update({
+    where: { id: order.id },
+    data: {
+      price: amount,
+      paymentLink: payment.confirmationUrl,
+      paymentId: payment.id,
+      status: 'awaiting_payment',
+    },
+  })
+
+  await Promise.allSettled([
+    sendPaymentLinkEmail(receiptEmail, order.id, payment.confirmationUrl, amount),
+    order.user?.telegramId
+      ? sendPaymentLinkNotification(order.user.telegramId, order.id, payment.confirmationUrl, amount)
+      : Promise.resolve(),
+  ])
+
+  adminSessions.delete(chatId)
+  await bot.sendMessage(
+    chatId,
+    `✅ Счёт выставлен по заявке ${formatOrderId(order.id)} на ${amount.toLocaleString('ru-RU')} ₽`,
+    {
+      reply_markup: {
+        inline_keyboard: [[{ text: 'Открыть заявку', callback_data: `admin:order:${order.id}` }]],
+      },
+    }
+  )
+}
+
+async function saveAdminResultFile(file: TelegramBot.File, fileName: string, orderId: string): Promise<string> {
+  const bot = makeBot()
+  if (!bot) throw new Error('Bot not configured')
+  const fileUrl = await bot.getFileLink(file.file_id)
+  const response = await fetch(fileUrl)
+  const arrayBuffer = await response.arrayBuffer()
+  const buffer = Buffer.from(arrayBuffer)
+  const safeName = fileName.replace(/[^a-zA-Z0-9а-яёА-ЯЁ._-]/g, '_')
+  const filename = `${Date.now()}_${safeName}`
+
+  const publicDir = path.join(process.cwd(), 'public', 'uploads', 'results', orderId)
+  try {
+    await mkdir(publicDir, { recursive: true })
+    await writeFile(path.join(publicDir, filename), buffer)
+    return `/api/files/results/${orderId}/${filename}`
+  } catch {
+    const tmpDir = path.join(os.tmpdir(), 'studyassist-results', orderId)
+    await mkdir(tmpDir, { recursive: true })
+    await writeFile(path.join(tmpDir, filename), buffer)
+    return `/api/files/results/${orderId}/${filename}`
+  }
+}
+
+async function handleAdminResultFileUpload(
+  bot: TelegramBot,
+  chatId: string,
+  msg: TelegramBot.Message,
+  session: AdminSession
+) {
+  const document = msg.document
+  const photo = msg.photo?.[msg.photo.length - 1]
+  const fileId = document?.file_id || photo?.file_id
+  const fileName = document?.file_name || `photo_${Date.now()}.jpg`
+
+  if (!fileId) {
+    await bot.sendMessage(chatId, '⚠️ Не удалось определить файл. Попробуйте ещё раз.')
+    return
+  }
+
+  const fileInfo = await bot.getFile(fileId)
+  const savedPath = await saveAdminResultFile(fileInfo, fileName, session.orderId)
+  session.uploadedFiles = [...(session.uploadedFiles || []), savedPath]
+  adminSessions.set(chatId, session)
+
+  await bot.sendMessage(
+    chatId,
+    `📎 Файл добавлен (${session.uploadedFiles.length} шт.).\nОтправьте ещё файлы или нажмите «Завершить и отправить клиенту».`,
+    {
+      reply_markup: {
+        inline_keyboard: [[{ text: '✅ Завершить и отправить клиенту', callback_data: `admin:result_done:${session.orderId}` }]],
+      },
+    }
+  )
+}
+
+async function completeOrderWithResultFiles(bot: TelegramBot, chatId: string, orderId: string) {
+  const session = adminSessions.get(chatId)
+  if (!session || session.mode !== 'awaiting_result_files' || session.orderId !== orderId) {
+    await bot.sendMessage(chatId, '⚠️ Сначала загрузите файлы результата.')
+    return
+  }
+
+  const uploaded = session.uploadedFiles || []
+  if (!uploaded.length) {
+    await bot.sendMessage(chatId, '⚠️ Нет загруженных файлов. Пришлите хотя бы один файл.')
+    return
+  }
+
+  const order = await prisma.order.findUnique({
+    where: { id: orderId },
+    include: { user: true },
+  })
+  if (!order) {
+    adminSessions.delete(chatId)
+    await bot.sendMessage(chatId, '❌ Заявка не найдена.')
+    return
+  }
+
+  const existingFiles: string[] = order.resultFiles ? JSON.parse(order.resultFiles) : []
+  const allFiles = [...existingFiles, ...uploaded]
+
+  await prisma.order.update({
+    where: { id: orderId },
+    data: {
+      resultFiles: JSON.stringify(allFiles),
+      status: 'completed',
+    },
+  })
+
+  const clientEmail = order.user?.email || order.clientEmail
+  await Promise.allSettled([
+    clientEmail ? sendWorkCompletedEmail(clientEmail, order.id, allFiles.length) : Promise.resolve(),
+    order.user?.telegramId ? sendWorkCompletedNotification(order.user.telegramId, order.id, allFiles.length) : Promise.resolve(),
+  ])
+
+  adminSessions.delete(chatId)
+  await bot.sendMessage(chatId, `✅ Заявка ${formatOrderId(orderId)} закрыта статусом «Готово». Файлы отправлены клиенту.`)
 }
 
 // ─── Callback Query ───────────────────────────────────────────────────────────
@@ -626,6 +922,40 @@ async function handleCallbackQuery(bot: TelegramBot, query: TelegramBot.Callback
 
   // Для остальных кнопок — сразу сбрасываем индикатор загрузки
   await bot.answerCallbackQuery(query.id).catch(() => {})
+
+  if (data === 'admin:orders') { await handleAdminOrdersList(bot, chatId); return }
+  if (data === 'admin:find_hint') {
+    await bot.sendMessage(chatId, 'Введите /ao чтобы открыть последние заявки, затем выберите нужную.')
+    return
+  }
+  if (data.startsWith('admin:order:')) {
+    await handleAdminOrderDetail(bot, chatId, data.slice('admin:order:'.length))
+    return
+  }
+  if (data.startsWith('admin:invoice:')) {
+    const orderId = data.slice('admin:invoice:'.length)
+    adminSessions.set(chatId, { mode: 'awaiting_price', orderId, createdAt: Date.now() })
+    await bot.sendMessage(chatId, `💳 Введите сумму счёта для заявки ${formatOrderId(orderId)} (только число, например 4500):`)
+    return
+  }
+  if (data.startsWith('admin:result:')) {
+    const orderId = data.slice('admin:result:'.length)
+    adminSessions.set(chatId, { mode: 'awaiting_result_files', orderId, uploadedFiles: [], createdAt: Date.now() })
+    await bot.sendMessage(
+      chatId,
+      `📎 Режим загрузки файлов результата для ${formatOrderId(orderId)}.\nПришлите файлы (документы/изображения), затем нажмите «Завершить и отправить клиенту».`,
+      {
+        reply_markup: {
+          inline_keyboard: [[{ text: '✅ Завершить и отправить клиенту', callback_data: `admin:result_done:${orderId}` }]],
+        },
+      }
+    )
+    return
+  }
+  if (data.startsWith('admin:result_done:')) {
+    await completeOrderWithResultFiles(bot, chatId, data.slice('admin:result_done:'.length))
+    return
+  }
 
   if (data === 'cmd:orders') { await handleOrdersList(bot, chatId); return }
   if (data === 'cmd:profile') { await handleProfile(bot, chatId); return }
@@ -733,8 +1063,19 @@ async function handleAdminSetStatus(
   }
 
   const updated = await prisma.order.findUnique({ where: { id: orderId }, include: { user: true } })
-  if (updated?.user?.telegramId) {
-    await bot.sendMessage(updated.user.telegramId,
+  if (!updated) return
+
+  const notifyEmail = updated.user?.email || updated.clientEmail || null
+  await Promise.allSettled([
+    notifyEmail ? sendStatusUpdateEmail(notifyEmail, updated.id, newStatus, updated.paymentLink || undefined) : Promise.resolve(),
+    updated.user?.telegramId
+      ? sendStatusUpdateNotification(updated.user.telegramId, updated.id, newStatus, updated.paymentLink || undefined)
+      : Promise.resolve(),
+  ])
+
+  if (updated.user?.telegramId) {
+    await bot.sendMessage(
+      updated.user.telegramId,
       `📋 *Заявка ${formatOrderId(orderId)}*\n\nСтатус изменён: *${label}*`,
       {
         parse_mode: 'Markdown',
