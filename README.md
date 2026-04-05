@@ -158,6 +158,7 @@ sudo certbot --nginx -d studyassist.ru -d www.studyassist.ru
 | `YANDEX_CLIENT_SECRET` | Secret Яндекс |
 | `TELEGRAM_BOT_TOKEN` | Токен бота Telegram |
 | `TELEGRAM_CHAT_ID` | ID чата для уведомлений |
+| `SUPPORT_CHAT_ID` | (Опционально) ID отдельной группы для онлайн-чата поддержки |
 | `SMTP_HOST` | SMTP сервер (smtp.beget.com) |
 | `SMTP_PORT` | SMTP порт (465) |
 | `SMTP_USER` | Email для отправки |
@@ -277,6 +278,92 @@ sudo tail -f /var/log/nginx/studyassist.error.log
 **Файлы не загружаются**: Проверьте права на `/var/www/studyassist/public/uploads/`
 
 **PM2 не стартует**: Проверьте `pm2 logs studyassist --err`
+
+### Диагностика: сообщения онлайн-чата не приходят в Telegram
+
+1. Проверить, что процесс запущен и читает актуальный `.env`:
+```bash
+cd /var/www/studyassist
+pm2 status
+pm2 env studyassist | rg "TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID|SUPPORT_CHAT_ID"
+```
+
+2. Смотреть серверные логи приложения в реальном времени:
+```bash
+pm2 logs studyassist --lines 200
+pm2 logs studyassist --err --lines 200
+```
+
+3. Если в `ecosystem.config.js` настроены файловые логи, смотреть их:
+```bash
+tail -f /var/log/studyassist/combined.log
+tail -f /var/log/studyassist/error.log
+```
+
+4. Проверить webhook Telegram:
+```bash
+curl -s "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/getWebhookInfo"
+```
+
+Если Telegram отвечает `404 Not Found`, проблема в токене бота (а не в `chat_id`):
+- переменная `$TELEGRAM_BOT_TOKEN` пуста в текущем shell, или
+- токен неверный/с опечаткой, или
+- токен был отозван в BotFather.
+
+Если Telegram отвечает `401 Unauthorized`, токен точно невалидный:
+- токен изменён/перевыпущен в BotFather и старый больше не работает;
+- в `.env` записан неверный токен;
+- после правки `.env` не выполнен `pm2 restart ... --update-env`.
+
+Проверка, что переменная не пустая:
+```bash
+printf '%s\n' "$TELEGRAM_BOT_TOKEN"
+```
+
+Проверка токена через API:
+```bash
+curl -s "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/getMe"
+```
+Для валидного токена должен прийти JSON с `"ok": true`.
+Ожидаемый формат токена: `<digits>:<secret>` (например `123456789:AA...`).
+
+5. Проверить, может ли бот писать в нужную группу:
+```bash
+curl -s -X POST "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendMessage" \
+  -H "Content-Type: application/json" \
+  -d '{"chat_id":"-100XXXXXXXXXX","text":"test from server"}'
+```
+
+Если ответ `{"ok":false,"error_code":400,"description":"Bad Request: chat not found"}`, значит:
+- бот не добавлен в эту группу/канал, или
+- указан неверный `chat_id`, или
+- бот был удалён/заблокирован в группе.
+
+Быстрый способ получить корректный ID группы:
+```bash
+curl -s "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/getUpdates" | jq .
+```
+Напишите любое сообщение в целевой группе и возьмите `message.chat.id` (для супергруппы обычно начинается с `-100`).
+
+6. `SUPPORT_CHAT_ID` можно указывать без кавычек:
+```env
+SUPPORT_CHAT_ID=-1001234567890
+```
+или в кавычках — тоже допустимо:
+```env
+SUPPORT_CHAT_ID="-1001234567890"
+```
+После изменения `.env` перезапустите процесс:
+```bash
+pm2 restart studyassist --update-env
+```
+
+Если вы запускаете `curl` из shell, переменные из `.env` нужно явно загрузить:
+```bash
+set -a
+source .env
+set +a
+```
 
 ---
 

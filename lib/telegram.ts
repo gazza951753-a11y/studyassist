@@ -3,11 +3,36 @@ import path from 'path'
 import { resolveStoredFileAbsolutePath } from '@/lib/file-storage'
 
 let bot: TelegramBot | null = null
+let invalidTokenWarned = false
+
+function normalizeTelegramError(err: unknown): Record<string, unknown> {
+  const maybeError = err as {
+    code?: string
+    message?: string
+    response?: { statusCode?: number; body?: { description?: string; error_code?: number } }
+  }
+
+  return {
+    code: maybeError?.code || 'UNKNOWN',
+    message: maybeError?.message || String(err),
+    statusCode: maybeError?.response?.statusCode,
+    errorCode: maybeError?.response?.body?.error_code,
+    description: maybeError?.response?.body?.description,
+  }
+}
 
 function getBot(): TelegramBot | null {
-  if (!process.env.TELEGRAM_BOT_TOKEN) return null
+  const token = (process.env.TELEGRAM_BOT_TOKEN || '').trim()
+  if (!token) return null
+  if (!/^\d+:[A-Za-z0-9_-]{20,}$/.test(token)) {
+    if (!invalidTokenWarned) {
+      console.warn('TELEGRAM_BOT_TOKEN has invalid format; Telegram API may return 401 Unauthorized')
+      invalidTokenWarned = true
+    }
+    return null
+  }
   if (!bot) {
-    bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, { polling: false })
+    bot = new TelegramBot(token, { polling: false })
   }
   return bot
 }
@@ -232,22 +257,26 @@ export async function sendSupportSessionToTelegram(data: {
 }): Promise<number | null> {
   const tgBot = getBot()
   const chatId = process.env.SUPPORT_CHAT_ID || process.env.TELEGRAM_CHAT_ID
-  if (!tgBot || !chatId) return null
+  if (!tgBot || !chatId) {
+    console.warn('sendSupportSessionToTelegram skipped: missing TELEGRAM_BOT_TOKEN or SUPPORT_CHAT_ID/TELEGRAM_CHAT_ID')
+    return null
+  }
 
   const who = data.name || 'Аноним'
   const contactLine = data.contact ? `📱 ${data.contact}` : ''
   const msgText = (
-    `💬 *Новый чат с поддержкой*\n` +
+    `💬 Новый чат с поддержкой\n` +
     `👤 ${who}${contactLine ? ' | ' + contactLine : ''}\n\n` +
     `${data.text}\n\n` +
     `▫️ [session:${data.sessionId}]`
   )
 
   try {
-    const msg = await tgBot.sendMessage(chatId, msgText, { parse_mode: 'Markdown' })
+    // Важно: без parse_mode, чтобы текст пользователя/контакт не ломал Markdown-парсер Telegram.
+    const msg = await tgBot.sendMessage(chatId, msgText)
     return msg.message_id
   } catch (err) {
-    console.error('sendSupportSessionToTelegram error:', err)
+    console.error('sendSupportSessionToTelegram error:', { chatId, ...normalizeTelegramError(err) })
     return null
   }
 }
@@ -264,11 +293,16 @@ export async function sendSupportMessageToTelegram(data: {
 }): Promise<void> {
   const tgBot = getBot()
   const chatId = process.env.SUPPORT_CHAT_ID || process.env.TELEGRAM_CHAT_ID
-  if (!tgBot || !chatId) return
+  if (!tgBot || !chatId) {
+    console.warn('sendSupportMessageToTelegram skipped: missing TELEGRAM_BOT_TOKEN or SUPPORT_CHAT_ID/TELEGRAM_CHAT_ID')
+    return
+  }
 
   const msgText = `💬 ${data.name || 'Посетитель'}: ${data.text}\n\n▫️ [session:${data.sessionId}]`
 
   await tgBot.sendMessage(chatId, msgText, {
     ...(data.tgGroupMsgId ? { reply_to_message_id: data.tgGroupMsgId } : {}),
+  }).catch(err => {
+    console.error('sendSupportMessageToTelegram error:', { chatId, ...normalizeTelegramError(err) })
   })
 }
